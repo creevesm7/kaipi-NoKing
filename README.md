@@ -1,11 +1,29 @@
-# kaipi（开辟）
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/kaipi-logo-dark.svg">
+    <img src="docs/assets/kaipi-logo.svg" alt="kaipi 标志：树状上下文与探索分支" width="64" height="64" align="absmiddle">
+  </picture>
+  &nbsp;kaipi（开辟）
+</h1>
 
-**用会话树管理上下文的命令行编程 Agent。**
+<p align="center"><strong>用会话树管理上下文的命令行编程 Agent。</strong></p>
+
+<p align="center">
+  <a href="https://github.com/jingchaoqi/kaipi/releases/latest"><img src="https://img.shields.io/github/v/release/jingchaoqi/kaipi?style=flat-square&amp;label=release&amp;color=58B99C" alt="最新版本"></a>
+  <a href="https://github.com/jingchaoqi/kaipi/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/jingchaoqi/kaipi/ci.yml?branch=master&amp;style=flat-square&amp;label=build" alt="构建状态"></a>
+  <a href="#快速开始"><img src="https://img.shields.io/badge/python-%E2%89%A53.11-627D6D?style=flat-square" alt="Python ≥3.11"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-627D6D?style=flat-square" alt="MIT 许可证"></a>
+</p>
+
+<p align="center">
+  <a href="#快速开始">快速开始</a> ·
+  <a href="#分支工作流">分支工作流</a> ·
+  <a href="https://github.com/jingchaoqi/kaipi/releases/latest">下载</a> ·
+  <a href="docs/CONCEPTS.md">设计原理</a>
+</p>
 
 kaipi 能阅读代码、修改文件、执行命令和运行测试。你可以从任意一轮分支探索，
 再把有用的结论带回主线，让后续对话保持精简。
-
-[快速开始](#快速开始) · [分支工作流](#分支工作流) · [下载](https://github.com/jingchaoqi/kaipi/releases/latest) · [设计原理](docs/CONCEPTS.md)
 
 ## 核心亮点
 
@@ -28,19 +46,37 @@ kaipi 能阅读代码、修改文件、执行命令和运行测试。你可以�
 从 [Releases](https://github.com/jingchaoqi/kaipi/releases/latest) 下载 `.whl` 安装包，然后执行：
 
 ```sh
-uv tool install --force ./kaipi-*.whl
+uv tool install --force ./kaipi-0.1.5-py3-none-any.whl
 cd /path/to/your/project
 kaipi
 ```
 
-首次运行会引导配置 API 提供商、地址、key 和模型。配置完成后，直接描述任务：
+首次运行先用双语问候，选择简体中文或 English，再按所选语言配置 API 提供商和模型。之后可在 `/config` 切换界面语言，CLI 与 Canvas 保持一致；模型回复语言不受影响。配置完成后，直接描述任务：
 
 ```text
 找出登录接口偶发超时的原因，修复并运行相关测试。
 ```
 
 后续用 `kaipi -c` 继续最近的会话，或用 `kaipi -r <会话id>` 打开指定会话。
-升级时下载新版安装包，执行同一条安装命令即可。
+用 `kaipi version` 或 `/version` 查看版本；用 `kaipi update` 更新，或在对话中输入
+`/update`，校验安装包后更新并接回原会话（支持 uv tool 安装）。终端每天后台检查一次新版，
+提示当前版本、最新版本和 Release 链接。用 `/config` 或 `kaipi config` 设置每日自动检查更新：
+上下键选择、左关右开，修改立即保存，Esc 返回。未保存过此设置时，`KAIPI_NO_UPDATE_CHECK=1`
+可关闭自动检查；在面板中明确设置后，以保存的选择为准。手动 `/update` 不受影响。
+支持从任意历史正式版直接升级，保留已保存的会话、附件、配置和回退快照，不保证降级兼容。
+旧版尚无更新命令时，先下载新版安装包，执行 `uv tool install --force <安装包.whl>` 后运行 `kaipi -c`。
+
+## 图片与文件
+
+- **终端**：粘贴文件路径添加附件；用 `Ctrl+V` 读取系统剪贴板中的截图或文件。
+  可连续粘贴多张图片，输入框以 `[image1]`、`[image2]` 显示，其他文件以 `[file1]` 显示；退格移除。
+  Linux 剪贴板需要 `wl-clipboard` 或 `xclip`。
+- **Canvas**：直接粘贴、拖入文件，或点击「附件」选择；发送前可以移除，历史记录中可以展开查看。
+- 按文件实际内容识别：HEIC、AVIF、TIFF 等图片自动转换，Office、演示文稿、EPUB 等文档自动提取；
+  代码和文本保留原文。图片、PDF 需要所选模型支持。
+
+附件随消息保存转换快照。每条最多 8 个原文件，单个最多 20 MiB；
+更多格式及限制见[附件说明](docs/ADVANCED.md#attachments)。
 
 ## 分支工作流
 
@@ -76,8 +112,14 @@ N1> 根据这个结论实现方案，并补充测试
 | `/go N1` · `/graft N2` | 从指定节点继续；将另一分支的结论带入下一轮 |
 | `/archive N2` · `/restore N2` | 归档或恢复整条子树 |
 | `/rewind` | 用方向键选择节点，预览并回退代码、对话或两者 |
+| `/status` | 查看模型、会话、上下文占用、用量与费用概览 |
+| `/new` | 保留旧对话，清空显示并进入新对话；用 `/resume` 找回历史 |
+| `/resume` | 上下键选择历史对话，回车进入；首条问题会自动生成会话标题 |
 | `/ledger` · `/raw` | 查看用量账本；检查下一轮将发送的完整上下文 |
-| `/provider` · `/model` | 配置 API 提供商；切换模型 |
+| `/provider` · `/model` | 配置或刷新提供商模型与价格；上下键切换模型，Esc 取消 |
+| `/config` | 设置界面语言和每日自动检查更新：上下选择、左右修改，立即生效，Esc 返回 |
+| `/statusline` | 定制底部状态行：上下选择、左右轮换选项，Esc 保存；目录可简约显示，上下文可显示百分比 |
+| `/inspect-context` | 将下一轮上下文导出到 workspace 根目录，文件名为「年月日时分秒-对话名-当前节点编号-context.md」 |
 | `/canvas` | 打开实验性浏览器画布，输入 `/cli` 返回终端 |
 | `Esc` | 停止当前回合；该回合不再进入后续上下文，已发生的消耗仍计费 |
 

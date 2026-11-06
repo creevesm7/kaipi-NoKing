@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 import tomllib
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -12,6 +13,7 @@ from urllib.parse import urlparse
 import httpx
 from pydantic import BaseModel, Field
 
+from kaipi.i18n import tr
 from kaipi.model import Message, Usage
 
 BASH_TOOL_DESCRIPTION = (
@@ -81,14 +83,15 @@ class ProviderConfig(BaseModel):
     # not the preserved-thinking beta, so the capability is a table column, not a name test.
     native_anthropic: bool = False
     needs_key: bool = True  # a self-hosted endpoint (ollama) authenticates nobody
+    model_catalog: str = ""  # another preset sharing the same model ids and pricing
 
 
 def _chat(url: str, env: str) -> ProviderConfig:
     return ProviderConfig(api="openai-chat", base_url=url, api_key_env=env)
 
 
-def _msgs(url: str, env: str) -> ProviderConfig:
-    return ProviderConfig(api="anthropic", base_url=url, api_key_env=env)
+def _msgs(url: str, env: str, catalog: str) -> ProviderConfig:
+    return ProviderConfig(api="anthropic", base_url=url, api_key_env=env, model_catalog=catalog)
 
 
 # Vendors that speak several protocols get one preset per protocol. The `-anthropic`
@@ -106,25 +109,29 @@ BUILTIN: dict[str, ProviderConfig] = {
         base_url="https://generativelanguage.googleapis.com/v1beta",
         api_key_env="GEMINI_API_KEY",
     ),
-    # DeepSeek: V4 Flash / Pro. Both protocols on the same key.
+    # DeepSeek: Flash / V4 Pro. Both protocols on the same key.
     "deepseek": _chat("https://api.deepseek.com/v1", "DEEPSEEK_API_KEY"),
-    "deepseek-anthropic": _msgs("https://api.deepseek.com/anthropic", "DEEPSEEK_API_KEY"),
+    "deepseek-anthropic": _msgs(
+        "https://api.deepseek.com/anthropic", "DEEPSEEK_API_KEY", "deepseek"
+    ),
     # Moonshot Kimi: K2.x / K3. `.ai` is the international platform, `.cn` the Chinese one;
     # they are separate accounts with separate keys, so the `-cn` presets take their own.
     "kimi": _chat("https://api.moonshot.ai/v1", "MOONSHOT_API_KEY"),
-    "kimi-anthropic": _msgs("https://api.moonshot.ai/anthropic", "MOONSHOT_API_KEY"),
+    "kimi-anthropic": _msgs("https://api.moonshot.ai/anthropic", "MOONSHOT_API_KEY", "kimi"),
     "kimi-cn": _chat("https://api.moonshot.cn/v1", "MOONSHOT_CN_API_KEY"),
-    "kimi-anthropic-cn": _msgs("https://api.moonshot.cn/anthropic", "MOONSHOT_CN_API_KEY"),
+    "kimi-anthropic-cn": _msgs(
+        "https://api.moonshot.cn/anthropic", "MOONSHOT_CN_API_KEY", "kimi-cn"
+    ),
     # GLM 5.x: Z.ai internationally, 智谱 open.bigmodel.cn in China; same split, own keys.
     "glm": _chat("https://api.z.ai/api/paas/v4", "ZAI_API_KEY"),
-    "glm-anthropic": _msgs("https://api.z.ai/api/anthropic", "ZAI_API_KEY"),
+    "glm-anthropic": _msgs("https://api.z.ai/api/anthropic", "ZAI_API_KEY", "glm"),
     "glm-cn": _chat("https://open.bigmodel.cn/api/paas/v4", "ZHIPU_API_KEY"),
-    "glm-anthropic-cn": _msgs("https://open.bigmodel.cn/api/anthropic", "ZHIPU_API_KEY"),
+    "glm-anthropic-cn": _msgs("https://open.bigmodel.cn/api/anthropic", "ZHIPU_API_KEY", "glm-cn"),
     # OpenCode Zen (pay per token) and Go (subscription): one key, many vendors behind it.
     "opencode": _chat("https://opencode.ai/zen/v1", "OPENCODE_API_KEY"),
-    "opencode-anthropic": _msgs("https://opencode.ai/zen", "OPENCODE_API_KEY"),
+    "opencode-anthropic": _msgs("https://opencode.ai/zen", "OPENCODE_API_KEY", "opencode"),
     "opencode-go": _chat("https://opencode.ai/zen/go/v1", "OPENCODE_API_KEY"),
-    "opencode-go-anthropic": _msgs("https://opencode.ai/zen/go", "OPENCODE_API_KEY"),
+    "opencode-go-anthropic": _msgs("https://opencode.ai/zen/go", "OPENCODE_API_KEY", "opencode-go"),
     "qwen": _chat("https://dashscope.aliyuncs.com/compatible-mode/v1", "DASHSCOPE_API_KEY"),
     "openrouter": _chat("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY"),
     "groq": _chat("https://api.groq.com/openai/v1", "GROQ_API_KEY"),
@@ -172,6 +179,15 @@ def parse_models(listed: str) -> list[str]:
     return [m for m in re.split(r"[,\uff0c\s]+", listed) if m]
 
 
+def remove_auth(name: str) -> Path:
+    data = auth()
+    data.get("providers", {}).pop(name, None)
+    if data.get("provider") == name or str(data.get("model", "")).startswith(name + "/"):
+        data.pop("model", None)
+        data.pop("provider", None)
+    return _write(data)
+
+
 def use_model(provider: str, model: str) -> Path:
     """Activate one model, always as `<provider>/<id>`. The provider is the one the user
     listed the model under in `/provider`, with the endpoint and key they gave it; a price
@@ -194,10 +210,14 @@ def _write(data: dict[str, Any]) -> Path:
         body += [""]
     # It holds credentials: 600 before a byte is written, not after - write-then-chmod
     # leaves the key world-readable for a moment under the usual 022 umask.
-    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    p.chmod(0o600)  # O_CREAT's mode does not apply to a file that already existed
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write("\n".join(body))
+    fd, temporary = tempfile.mkstemp(dir=p.parent)  # mode 600 from creation
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("\n".join(body))
+        os.replace(temporary, p)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
     return p
 
 
@@ -250,13 +270,15 @@ def build(
     if name is None:
         name, _, model = spec.partition("/")
         if not model:
-            raise ValueError(f"{spec}: not in pricing.toml; use <provider>/<model>")
+            raise ValueError(tr("{spec} 不在价格表中，请使用 <provider>/<model>", spec=spec))
     elif model.startswith(f"{name}/"):  # a pricing entry keyed as <provider>/<model id>
         model = model[len(name) + 1 :]
     known = {**BUILTIN, **providers}
     cfg = known.get(name)
     if cfg is None:
-        raise ValueError(f"unknown provider {name!r}; known: {', '.join(known)}")
+        raise ValueError(
+            tr("未知提供商 {name}；可选：{known}", name=repr(name), known=", ".join(known))
+        )
     # Precedence: the environment (a deliberate one-off), then `/provider`'s file, then
     # the preset. So an export still overrides a saved key without having to unsave it.
     saved: dict[str, str] = auth().get("providers", {}).get(name, {})
@@ -272,8 +294,11 @@ def build(
     if cfg.needs_key and cfg.api_key_env and not key:
         # A sentence the user can act on, rather than a 401 from the vendor five seconds later.
         raise ValueError(
-            f"{name} 还没有 API key。运行 `kaipi provider` 配置一次，"
-            f"或者 export {cfg.api_key_env}=..."
+            tr(
+                "{name} 还没有 API key。运行 kaipi provider 配置，或者 export {env}=...",
+                name=name,
+                env=cfg.api_key_env,
+            )
         )
     if cfg.api == "anthropic":
         from kaipi.providers.anthropic import AnthropicProvider

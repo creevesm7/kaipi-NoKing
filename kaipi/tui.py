@@ -11,7 +11,8 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from functools import partial
 from io import StringIO
 from queue import Empty, SimpleQueue
 from typing import Any
@@ -27,23 +28,42 @@ from prompt_toolkit.filters import Always, Condition
 from prompt_toolkit.formatted_text import ANSI, FormattedText, to_formatted_text
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import FloatContainer, HSplit, Layout, Window
+from prompt_toolkit.keys import Keys
+from prompt_toolkit.layout import Float, FloatContainer, HSplit, Layout, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style
 from prompt_toolkit.utils import get_cwidth
-from prompt_toolkit.widgets import Label
+from prompt_toolkit.widgets import Label, RadioList
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.padding import Padding
 
-from kaipi import agent, cli, context, graph, ledger
+from kaipi import agent, attachments, cli, command_ui, context, graph, history, ledger, update
+from kaipi.i18n import tr
 from kaipi.store import kaipi_dir
 
 FPS = 60
 FADE_SECONDS = 0.5
 IDLE_COLOR = (112, 122, 130)
+PHASES = (
+    "就绪",
+    "准备中",
+    "等待模型",
+    "执行命令",
+    "处理结果",
+    "等待重试",
+    "整理回答",
+    "整理结果",
+    "生成标题",
+    "正在停止",
+    "已完成",
+    "已停止",
+    "未完成",
+)
+PHASE_WIDTH = 8  # Chinese uses four full-width characters; English is measured at render time.
 
 
 def markdown(text: str, width: int, *, color: bool = True, indent: int = 0) -> str:
@@ -83,19 +103,19 @@ def command_summary(command: str) -> str:
     """An action label when the model supplied no explanation, not invented reasoning."""
     program = command.strip().split(maxsplit=1)[0] if command.strip() else ""
     if program in {"cat", "sed", "head", "tail", "rg", "grep", "find", "ls", "pwd", "wc"}:
-        return "查看项目文件与代码"
+        return tr("查看项目文件与代码")
     if program in {"pytest", "ruff", "mypy", "uv", "python", "python3", "npm", "pnpm", "make"}:
-        return "运行项目命令与检查"
+        return tr("运行项目命令与检查")
     if program == "git":
-        return "执行 Git 操作"
-    return "执行命令"
+        return tr("执行 Git 操作")
+    return tr("执行命令")
 
 
 def pick_node(s: cli.Session, *, rewind: bool = False) -> str | None:
     """Browse the same tree for /tree, /go and /rewind; only Enter commits a choice."""
     rows = cli.tree_rows(s, compact=True, live_only=not rewind)
     if not rows:
-        print("还没有可选择的节点")
+        print(tr("还没有可选择的节点"))
         return None
     st = s.log.state
     ids = [nid for nid, _ in rows]
@@ -164,14 +184,16 @@ def pick_node(s: cli.Session, *, rewind: bool = False) -> str | None:
         width = max(1, get_app().output.get_size().columns - 1)
         own = ledger.fmt(ledger.own_tokens(st, n.id))
         cost = s.pricing.price(n.model).cost(n.usage)
-        grafts = ", ".join(s.name(g.src_id) for g in n.grafts) or "无"
-        role = "主线" if n.id == trunk else "探索分支：下一句从此分叉"
-        action = "选择后预览文件并确认回退方式" if rewind else role
+        grafts = ", ".join(s.name(g.src_id) for g in n.grafts) or tr("无")
+        role = tr("主线") if n.id == trunk else tr("探索分支：下一句从此分叉")
+        action = tr("选择后预览文件并确认回退方式") if rewind else role
         return "\n".join(
             short_line(line, width)
             for line in [
                 f"{s.name(n.id)} · {context.user_input(n)}",
-                f"{own} tokens · ${cost:.4f} · 嫁接：{grafts}",
+                tr(
+                    "{own} tokens · ${cost:.4f} · 嫁接：{grafts}", own=own, cost=cost, grafts=grafts
+                ),
                 action,
             ]
         )
@@ -187,16 +209,16 @@ def pick_node(s: cli.Session, *, rewind: bool = False) -> str | None:
         layout=Layout(
             HSplit(
                 [
-                    Label("回退到节点" if rewind else "会话树 · 选择继续的位置"),
+                    Label(tr("回退到节点") if rewind else tr("会话树 · 选择继续的位置")),
                     Window(
                         control, height=Dimension(max=10), dont_extend_height=True, cursorline=True
                     ),
                     Window(height=1),
                     Label(details),
                     Label(
-                        "↑↓ 浏览 · ←父节点 →子节点 · Enter "
-                        + ("选择" if rewind else "从此继续")
-                        + " · Esc 取消"
+                        tr("↑↓ 浏览 · ←父节点 →子节点 · Enter ")
+                        + (tr("选择") if rewind else tr("从此继续"))
+                        + tr(" · Esc 取消")
                     ),
                 ]
             ),
@@ -214,6 +236,59 @@ def pick_node(s: cli.Session, *, rewind: bool = False) -> str | None:
 
 def pick_rewind(s: cli.Session) -> str | None:
     return pick_node(s, rewind=True)
+
+
+def pick_session(s: cli.Session) -> str | None:
+    """An inline, scrolling session menu; opening or cancelling it changes nothing."""
+    rows = cli.session_rows(s.cwd, s.log.path.name)
+    if not rows:
+        print(tr("这个目录里还没有对话"))
+        return None
+
+    def label(line: str) -> str:
+        return short_line(line, max(1, get_app().output.get_size().columns - 5))
+
+    choices: RadioList[str] = RadioList(
+        [(p.stem, partial(label, line)) for p, line in rows],
+        default=s.log.path.stem,
+        select_on_focus=True,
+        open_character="",
+        select_character="▸",
+        close_character="",
+        show_cursor=False,
+    )
+    kb = KeyBindings()
+
+    @kb.add("enter", eager=True)
+    def accept(event: Any) -> None:
+        event.app.exit(result=choices.current_value)
+
+    @kb.add("escape", eager=True)
+    @kb.add("c-c")
+    @kb.add("c-d")
+    def cancel(event: Any) -> None:
+        event.app.exit(result=None)
+
+    app: Application[str | None] = Application(
+        layout=Layout(
+            HSplit(
+                [
+                    Label(tr("这个目录里的对话")),
+                    HSplit([choices], height=Dimension(max=10)),
+                    Label(tr("↑↓ 选择 · Enter 进入 · Esc 取消")),
+                ]
+            ),
+            focused_element=choices,
+        ),
+        key_bindings=kb,
+        style=Style.from_dict({"radio-selected": "bg:#30343b fg:#f3f4f6 bold"}),
+        full_screen=False,
+        erase_when_done=True,
+    )
+    try:
+        return app.run()
+    except (EOFError, KeyboardInterrupt):
+        return None
 
 
 class SlashCompleter(Completer):
@@ -242,8 +317,8 @@ class SlashCompleter(Completer):
                     yield Completion(
                         f"/{name} " if args else f"/{name}",
                         start_position=-len(text),
-                        display=f"/{name} {args}".strip(),
-                        display_meta=what,
+                        display=f"/{name} {tr(args)}".strip(),
+                        display_meta=tr(what),
                     )
             return
         if head == "resume" and " " not in rest.strip():
@@ -261,7 +336,7 @@ class SlashCompleter(Completer):
                     continue
                 sid = state.label(n.id)
                 if sid.lower().startswith(rest.lower()) or n.id.startswith(rest):
-                    tag = "" if n.status == "live" else " [已归档]"
+                    tag = "" if n.status == "live" else tr(" [已归档]")
                     yield Completion(
                         sid,
                         start_position=-len(rest),
@@ -291,11 +366,115 @@ class Terminal:
         self.done = threading.Event()
         self.completer = SlashCompleter(s)
         self._selecting = False
+        self.attachments: dict[str, attachments.Attachment] = {}
+        self._attachment_seq = {"image": 0, "file": 0}
+        self.notice = ""
+        self._exit_requested_at: float | None = None
+        self._pasting = False
+        self._submit_after_paste = False
+        paste_jobs: list[
+            tuple[Callable[[], tuple[list[attachments.Attachment], str]], str | None]
+        ] = []
         kb = KeyBindings()
+
+        def start_paste(
+            event: Any,
+            load: Callable[[], tuple[list[attachments.Attachment], str]],
+            replace: str | None = None,
+        ) -> None:
+            paste_jobs.append((load, replace))
+            if self._pasting:
+                return
+            self._pasting = True
+            self._cancel_paste = False
+            self.notice = tr("正在读取附件…")
+
+            async def read() -> None:
+                ok = True
+                failure = ""
+                try:
+                    while paste_jobs:
+                        job, original = paste_jobs.pop(0)
+                        try:
+                            items, text = await asyncio.to_thread(job)
+                            if self._cancel_paste:
+                                paste_jobs.clear()
+                                self.notice = tr("已取消添加附件")
+                                break
+                            if items:
+                                buffer = self.session.default_buffer
+                                if original is not None and buffer.text == original:
+                                    buffer.text = ""
+                                self.add_attachments(items)
+                            elif text:
+                                self.paste_text(text)
+                                if self.notice and not self.notice.endswith(
+                                    tr(" · 回车发送 · 退格移除")
+                                ):
+                                    failure = self.notice
+                                    ok = False
+                            else:
+                                failure = tr("剪贴板为空")
+                                ok = False
+                        except (ValueError, OSError) as e:
+                            failure = str(e)
+                            ok = False
+                finally:
+                    if failure:
+                        self.notice = failure
+                    self._pasting = False
+                    submit, self._submit_after_paste = self._submit_after_paste, False
+                    event.app.invalidate()
+                if submit and ok:
+                    _enter(event)
+
+            event.app.create_background_task(read())
+
+        @kb.add(Keys.BracketedPaste)
+        def _paste(event: Any) -> None:
+            paths = attachments.pasted_paths(event.data)
+            if paths:
+                start_paste(event, lambda: ([attachments.Attachment.read(p) for p in paths], ""))
+            else:
+                self.paste_text(event.data)
+
+        @kb.add("c-v", eager=True)
+        def _clipboard(event: Any) -> None:
+            start_paste(event, attachments.clipboard)
+
+        @kb.add("backspace")
+        def _backspace(event: Any) -> None:
+            if self._pasting:
+                self._cancel_paste = True
+                return
+            buffer = event.current_buffer
+            marker = next(
+                (m for m in self.attachments if buffer.document.text_before_cursor.endswith(m)), ""
+            )
+            if marker:
+                buffer.delete_before_cursor(len(marker))
+                self.attachments.pop(marker)
+            else:
+                buffer.delete_before_cursor()
 
         @kb.add("enter")
         def _enter(event: Any) -> None:
+            if self._pasting:
+                self._submit_after_paste = True
+                return
             buffer = event.current_buffer
+            # Some terminal emulators insert dragged file paths without bracketed paste.
+            # An entire file selection still counts as an explicit attachment gesture.
+            if not any(marker in buffer.text for marker in self.attachments):
+                paths = attachments.pasted_paths(buffer.text)
+                if paths:
+                    start_paste(
+                        event,
+                        lambda: ([attachments.Attachment.read(p) for p in paths], ""),
+                        replace=buffer.text,
+                    )
+                    self._submit_after_paste = True
+                    return
             state = buffer.complete_state
             if state and state.current_completion:
                 # Enter accepts the highlighted command or argument before submitting.
@@ -305,6 +484,13 @@ class Terminal:
                     buffer.apply_completion(state.current_completion)
                 finally:
                     self._selecting = False
+            if (
+                any(marker in buffer.text for marker in self.attachments)
+                and buffer.text.startswith("/")
+                and not buffer.text.startswith("/explore ")
+            ):
+                self.notice = tr("附件请随问题发送；也可使用 /explore 问题")
+                return
             buffer.validate_and_handle()
 
         has_candidates = Condition(lambda: self.session.default_buffer.complete_state is not None)
@@ -344,7 +530,19 @@ class Terminal:
             if self.running:
                 self.stop.set()
             else:
-                event.app.exit(exception=KeyboardInterrupt())
+                now = time.monotonic()
+                if self._exit_requested_at is not None and now - self._exit_requested_at < 3:
+                    event.app.exit(exception=KeyboardInterrupt())
+                    return
+                self._exit_requested_at = now
+                self.notice = tr("再按一次 Ctrl+C 退出（3 秒内）；继续输入可取消")
+
+                def expire() -> None:
+                    if self._exit_requested_at == now:
+                        self.cancel_exit_confirmation()
+                        event.app.invalidate()
+
+                event.app.loop.call_later(3, expire)
 
         self.session: PromptSession[str] = PromptSession(
             message=self.message,
@@ -365,16 +563,57 @@ class Terminal:
         # it compact and put spare space above it, so output cannot move the input.
         self.session.layout.current_window.dont_extend_height = Always()
         prompt_layout = self.session.layout.container
-        floats = []
+        floats: list[Float] = []
         for container in self.session.layout.walk():
             if isinstance(container, FloatContainer):
-                floats.extend(container.floats)
+                floats.extend(f for f in container.floats if not f.ycursor)
                 container.floats = []
-        self.session.layout.container = FloatContainer(HSplit([Window(), prompt_layout]), floats)
+        self.session.layout.container = FloatContainer(
+            HSplit([Window(), CompletionsMenu(max_height=10, scroll_offset=1), prompt_layout]),
+            floats,
+        )
         self.session.default_buffer.on_text_changed += self.refresh_completions
         self.session.default_buffer.on_cursor_position_changed += self.refresh_completions
 
+    def add_attachments(self, items: list[attachments.Attachment]) -> None:
+        # Read/validate the whole batch first, so a bad file cannot leave a half-paste.
+        buffer = self.session.default_buffer
+        active = {m: a for m, a in self.attachments.items() if m in buffer.text}
+        attachments.validate([*active.values(), *items])
+        self.attachments = active
+        for item in items:
+            kind = item.kind
+            self._attachment_seq[kind] += 1
+            chip = f"[{kind}{self._attachment_seq[kind]}]"
+            self.attachments[chip] = item
+            buffer.insert_text(chip)
+        self.notice = items[-1].name + " · " + items[-1].summary + tr(" · 回车发送 · 退格移除")
+
+    def paste_text(self, text: str) -> None:
+        self.notice = ""
+        try:
+            paths = attachments.pasted_paths(text)
+            if paths:
+                self.add_attachments([attachments.Attachment.read(path) for path in paths])
+            else:
+                self.session.default_buffer.insert_text(
+                    text.replace("\r\n", "\n").replace("\r", "\n")
+                )
+        except (ValueError, OSError) as e:
+            self.notice = str(e)
+
+    def collect_input(self, text: str) -> str:
+        markers = sorted((m for m in self.attachments if m in text), key=text.index)
+        items = [self.attachments[m] for m in markers]
+        if not text:
+            return text  # a turn may finish while the next draft is still being edited
+        self.attachments.clear()
+        self._attachment_seq = {"image": 0, "file": 0}
+        self.notice = ""
+        return attachments.Input(text, items) if items else text
+
     def refresh_completions(self, buffer: Buffer) -> None:
+        self.cancel_exit_confirmation()
         if self._selecting:
             return
         candidates = (
@@ -386,6 +625,12 @@ class Terminal:
             CompletionState(buffer.document, candidates, complete_index=0) if candidates else None
         )
         buffer.on_completions_changed.fire()
+
+    def cancel_exit_confirmation(self) -> None:
+        if self._exit_requested_at is not None:
+            self._exit_requested_at = None
+            if self.notice.startswith(tr("再按一次 Ctrl+C")):
+                self.notice = ""
 
     def columns(self) -> int:
         try:
@@ -406,7 +651,7 @@ class Terminal:
         now, width = time.monotonic(), self.columns()
         # The ledger folds are much slower than drawing a frame. Keep their refresh
         # separate from the animation, and always refresh after a turn or resize.
-        if not self._bar or now - self._bar_at >= 0.5 or width != self._bar_width:
+        if not self._bar_at or now - self._bar_at >= 0.5 or width != self._bar_width:
             self._bar = self.s.status(width)
             self._bar_at, self._bar_width = now, width
         elapsed = (
@@ -414,7 +659,8 @@ class Terminal:
             if self.started_at
             else 0.0
         )
-        phase = "正在停止" if self.running and self.stop.is_set() else self.phase
+        phase = tr("正在停止" if self.running and self.stop.is_set() else self.phase)
+        phase_width = max(get_cwidth(tr(label)) for label in PHASES)
         if self.running:
             head = (elapsed * 8) % 12
             self._track_colors = []
@@ -453,7 +699,11 @@ class Terminal:
             paint(char, self._text_colors[min(i, len(self._text_colors) - 1)])
             for i, char in enumerate(phase)
         )
-        hint = "Esc 停止" if self.running else "等待输入"
+        padding = max(0, phase_width - get_cwidth(phase))
+        shimmer = " " * (padding // 2) + shimmer + " " * (padding - padding // 2)
+        hint = self.notice or (tr("Esc 停止") if self.running else tr("等待输入"))
+        reserved = 14 + phase_width + get_cwidth(f" · {elapsed:.3f}s · ")
+        hint = short_line(hint, max(1, width - reserved - 1))
         tail = paint(f" · {elapsed:.3f}s · {hint}", (220, 229, 231))
         activity = f"{track}  {shimmer}{tail}"
         return ANSI(f"{self.rule()}\n{activity}\n{self._bar}")
@@ -473,12 +723,14 @@ class Terminal:
 
     def hook(self, kind: str, text: str) -> None:
         if kind == "phase":
+            if text == "生成标题":
+                self.flush_answer()
             self.phase = text
             self._intent = ""
         else:
             self.phase = {
                 "cmd": "执行命令",
-                "out": "处理命令结果",
+                "out": "处理结果",
                 "wait": "等待重试",
                 "text": "整理回答",
                 "ledger": "整理结果",
@@ -547,14 +799,24 @@ class Terminal:
                 end="",
             )
 
-    def echo(self, line: str) -> None:
-        if line.startswith("/") and line.split()[0] != "/explore":
-            print(f"{cli.BOLD}{self.label()}{cli.RESET}{line}")
+    def replay(self) -> None:
+        def question(node: str, text: str) -> None:
+            self._intent = ""
+            self._tool_section = False
+            self.echo(text, label=f"{node}> ")
+
+        history.replay(self.s, question, self.hook)
+        self.phase = "就绪"
+        self._intent = ""
+        self._tool_section = False
+
+    def echo(self, line: str, *, label: str | None = None) -> None:
+        if label is None and line.startswith("/") and line.split()[0] != "/explore":
             return
         width = max(1, self.columns() - 1)
         rows: list[str] = []
         row, used = "", 0
-        for char in (f"  {self.label()}{line}  ").expandtabs(4):
+        for char in (f"  {label if label is not None else self.label()}{line}  ").expandtabs(4):
             size = get_cwidth(char)
             if char == "\n" or used + size > width:
                 rows.append(row + " " * (width - used))
@@ -568,13 +830,15 @@ class Terminal:
             FormattedText([("", "\n"), ("bg:#30343b fg:#f3f4f6", panel), ("", "\n")])
         )
 
-    def prompt(self) -> str:
+    def prompt(self, *, default: str = "") -> str:
         def start_fade() -> None:
             if self.fading():
                 get_app().create_background_task(self.fade_out(get_app()))
 
         with patch_stdout(raw=True):
-            line = self.session.prompt(pre_run=start_fade).strip()
+            line = self.collect_input(
+                self.session.prompt(default=default, pre_run=start_fade).strip()
+            )
         if line:
             self.echo(line)
         return line
@@ -666,13 +930,20 @@ class Terminal:
         try:
             with patch_stdout(raw=True):
                 while True:
-                    line = self.session.prompt(pre_run=start).strip()
+                    line = self.collect_input(self.session.prompt(pre_run=start).strip())
                     if line:
                         queued.append(line)
                     if self.done.is_set():
                         break
                     if line:
-                        self.write(f"{cli.DIM}已排队，这一轮结束后执行：{line}{cli.RESET}")
+                        self.write(
+                            tr(
+                                "{v0}已排队，这一轮结束后执行：{line}{v2}",
+                                v0=cli.DIM,
+                                line=line,
+                                v2=cli.RESET,
+                            )
+                        )
         finally:
             if self.finished_at is None:
                 finish()
@@ -695,27 +966,56 @@ class Terminal:
 def loop(s: cli.Session) -> str:
     """The tty loop. Returns "canvas" when the user hands the session to the canvas."""
     t = Terminal(s)
+    if s.leaf:
+        t.replay()
+    update.background(lambda text: print(f"\n{cli.DIM}{text}{cli.RESET}\n"))
     pending: list[str] = []
+    draft = ""
     while True:
         try:
+            from_queue = bool(pending)
             if pending:
                 line = pending.pop(0)
                 t.echo(line)
             else:
-                line = t.prompt()
+                line = t.prompt(default=draft) if draft else t.prompt()
+                draft = ""
         except (EOFError, KeyboardInterrupt):
             return "quit"
         if not line:
             continue
         try:
             if line.startswith("/"):
+                previous = s.log.path
+                if line.split()[0] == "/update" and (
+                    pending
+                    or t.attachments
+                    or t._pasting
+                    or (from_queue and t.session.default_buffer.text.strip() not in ("", line))
+                ):
+                    if from_queue and t.session.default_buffer.text.strip() != line:
+                        draft = t.session.default_buffer.text
+                    print(tr("还有排队消息或附件草稿，请处理完后再输入 /update。"))
+                    continue
                 if line.split()[0] in ("/canvas", "/cli"):
                     s.save()
                     return "canvas"
                 if line.split()[0] == "/explore":
-                    pending = t.turn(line[len("/explore") :].strip(), explore=True) + pending
-                elif not cli.slash(s, line[1:].split()):
+                    question = line[len("/explore") :].strip()
+                    if isinstance(line, attachments.Input):
+                        question = attachments.Input(question, line.attachments)
+                    pending = t.turn(question, explore=True) + pending
+                elif not command_ui.run(s, line[1:].split()):
                     return "quit"
+                elif line.split()[0] == "/new":
+                    pending.clear()
+                    t = Terminal(s)
+                elif s.log.path != previous:
+                    cli.clear_terminal()
+                    t = Terminal(s)
+                    t.replay()
+                elif line.split()[0] == "/statusline":
+                    t._bar_at = 0.0
             else:
                 pending = t.turn(line) + pending
         except (EOFError, KeyboardInterrupt):

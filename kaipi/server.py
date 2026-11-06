@@ -16,7 +16,8 @@ from urllib.parse import parse_qs, urlparse
 
 import typer
 
-from kaipi import agent, cli, context, graph, guard, ledger
+from kaipi import agent, attachments, cli, context, graph, guard, i18n, ledger
+from kaipi.i18n import tr
 from kaipi.model import Node, ReferenceEdge, blocks, text_of
 
 CANVAS_HTML = Path(__file__).with_name("canvas.html")
@@ -56,6 +57,13 @@ def transcript(n: Node) -> list[dict[str, str]]:
                 out.append({"kind": context.classify(b["text"]), "text": b["text"]})
             elif t == "text":
                 out.append({"kind": "assistant", "text": b["text"]})
+            elif t == "image":
+                src = b["source"]
+                out.append(
+                    {"kind": "image", "text": f"data:{src['media_type']};base64,{src['data']}"}
+                )
+            elif t == "document":
+                out.append({"kind": "attachment", "text": b.get("title", tr("PDF 附件"))})
             elif t == "tool_use":
                 out.append(
                     {
@@ -107,6 +115,7 @@ class Canvas:
                     "seq": n.seq,
                     "input": context.user_input(n),
                     "answer": context.final_answer(n),
+                    "attachments": context.has_attachments(n),
                     "own": ledger.own_tokens(st, n.id),
                     "ctx": n.context_tokens,
                     "tools": [{"id": i, "cmd": c} for i, c in context.tool_calls(n)],
@@ -166,36 +175,35 @@ class Canvas:
             return ""
         if argv[0] in ("cli", "quit", "exit"):
             self.request_handoff()
-            return "handing the session back to the terminal"
+            return tr("handing the session back to the terminal")
         if argv[0] == "canvas":
-            return "already on the canvas"
+            return tr("already on the canvas")
         if argv[0] == "explore":  # a model turn: must stream, must not hold the lock
             self.turn(" ".join(argv[1:]), explore=True)
-            return "exploration started"
+            return tr("exploration started")
         with self.lock:
             try:
                 out = cli.verb(self.s, argv)
             except Exception as e:  # noqa: BLE001 - surfaced to the user verbatim
-                return f"error: {e}"
+                return tr("错误：{error}", error=e)
             self.s.save()
         if out is not None:
             return "\n".join(out)
         # The rest would ask something in the terminal; the canvas says what it can instead.
         if argv[0] == "rewind" and len(argv) == 2:
-            return (
-                cli.rewind_preview(self.s, argv[1])
-                + "\nuse the node's right-click menu, or /rewind <id> both|code|conversation"
+            return cli.rewind_preview(self.s, argv[1]) + tr(
+                "\nuse the node's right-click menu, or /rewind <id> both|code|conversation"
             )
         if argv[0] == "resume":
             return "\n".join(line for _, line in cli.session_rows(self.s.cwd, self.s.log.path.name))
         if argv[0] in {n for n, _, _ in cli.COMMANDS}:
-            return f"/{argv[0]} needs the terminal: /cli, then run it there"
-        return f"unknown command /{argv[0]}"
+            return tr("/{v0} needs the terminal: /cli, then run it there", v0=argv[0])
+        return tr("unknown command /{v0}", v0=argv[0])
 
     def turn(self, text: str, explore: bool = False) -> None:
         with self.lock:
             if self.busy:
-                raise RuntimeError("a turn is already running")
+                raise RuntimeError(tr("a turn is already running"))
             self.stopping.clear()
             self.busy = True
         threading.Thread(target=self._run, args=(text, explore), daemon=True).start()
@@ -286,7 +294,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         if not self._authorised():
-            self._json({"error": "not a local, token-carrying request"}, 403)
+            self._json({"error": tr("not a local, token-carrying request")}, 403)
             return
         try:
             self._get()
@@ -298,7 +306,7 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         q = parse_qs(url.query)
         if url.path == "/":
-            body = CANVAS_HTML.read_bytes()
+            body = i18n.canvas_page(CANVAS_HTML.read_text(encoding="utf-8"))
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -320,7 +328,7 @@ class Handler(BaseHTTPRequestHandler):
         elif url.path == "/api/events":
             self._events()
         else:
-            self._json({"error": "not found"}, 404)
+            self._json({"error": tr("not found")}, 404)
 
     def _events(self) -> None:
         self.send_response(200)
@@ -347,12 +355,23 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorised() or not ctype.startswith("application/json"):
             # The JSON content type additionally forces a CORS preflight this server never
             # answers, so a plain cross-origin form post cannot reach any of this.
-            self._json({"error": "not a local, token-carrying JSON request"}, 403)
+            self._json({"error": tr("not a local, token-carrying JSON request")}, 403)
             return
         n = int(self.headers.get("Content-Length") or 0)
+        if not 0 <= n <= 56 * 1024 * 1024:
+            self.close_connection = True
+            self._json({"error": tr("请求过大；原始附件总大小最多 40 MiB")}, 413)
+            return
         body: dict[str, Any] = json.loads(self.rfile.read(n) or b"{}")
         path = urlparse(self.path).path
         try:
+            if path == "/api/attachments":
+                items = [
+                    attachments.Attachment.model_validate(item) for item in body["attachments"]
+                ]
+                attachments.validate(items)
+                self._json({"attachments": [item.describe() for item in items]})
+                return
             if path == "/api/handoff":
                 c.request_handoff()
                 self._json({"ok": True})
@@ -362,11 +381,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": True})
                 return
             if c.busy and path != "/api/pending":
-                self._json({"error": "a turn is running"}, 409)
+                self._json({"error": tr("a turn is running")}, 409)
                 return
             with c.lock:
                 if path == "/api/turn":
-                    c.turn(str(body["text"]), bool(body.get("explore")))
+                    items = [
+                        attachments.Attachment.model_validate(item)
+                        for item in body.get("attachments", [])
+                    ]
+                    text = (
+                        attachments.Input(str(body["text"]), items) if items else str(body["text"])
+                    )
+                    if not text.strip():
+                        raise ValueError(tr("请输入问题或添加附件"))
+                    c.turn(text, bool(body.get("explore")))
                 elif path == "/api/command":
                     self._json({"output": c.command(str(body["line"]))})
                     return
@@ -382,7 +410,7 @@ class Handler(BaseHTTPRequestHandler):
                     guard.reset(c.s.cwd)
                     c.dirty = False
                 else:
-                    self._json({"error": "not found"}, 404)
+                    self._json({"error": tr("not found")}, 404)
                     return
                 c.s.save()
             self._json({"ok": True})

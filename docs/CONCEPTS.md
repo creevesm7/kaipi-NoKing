@@ -23,6 +23,50 @@ for good, still billed), `tombstone` (permanent; one line remains).
 A node that was started and neither completed nor aborted - a crash, a kill -9 - folds to
 `tombstone`: there are no half-frozen payloads.
 
+### 1.0 User attachments
+
+Explicitly pasted/selected attachments are draft UI state until submitted. The input
+message then contains immutable content snapshots: base64 image/document blocks for
+normalized raster images and original PDF documents; tagged text blocks for UTF-8
+files and extracted document contents. Images are identified from bytes using Pillow
+and HEIF decoding, not extension checks; supported orientation/colour transformations,
+resizing and all bounded frames are handled before snapshots are frozen. Conversion
+metadata retains the original filename and describes any transformation. Local document
+converters handle other known content types; raw ZIP recursion and URL/cloud/plugin
+conversion are disabled. Workbooks retain formulas as source text. Text snapshots receive credential redaction.
+All format-specific logic lives in the `attachments` package, behind one replaceable
+callable: `parse(name, raw_bytes) -> (content_blocks, summary)`. The default implementation
+loads decoder libraries lazily. `Input` captures the validated blocks before entering
+the agent; context assembly only copies those snapshots and never invokes a parser.
+There is no converter registry, discovery mechanism, or plugin lifecycle in the agent.
+Replaying a node uses its payload, never the original file or clipboard. Question
+labels omit attachment bodies; the visible question retains numbered attachment markers. Grafts
+carry question/answer text and summaries as before, without copying binary attachments.
+
+The terminal recognizes complete pasted file selections (quoted/escaped paths or
+local file:// URLs), and Ctrl-V explicitly reads the local clipboard on macOS/Linux.
+Ordinary sentences mentioning paths are not implicitly read. Draft markers can be
+removed; queued submissions keep their own attachment snapshots. Enter during an
+in-flight clipboard read waits for it; successive pastes accumulate, including while a
+previous read is pending. Image and file markers use separate counters per submitted
+draft (`[image1]`, `[image2]`, `[file1]`); removing a marker does not renumber the others.
+A failed read keeps the draft. Command submissions
+with attachments are rejected except `/explore`, which keeps the same attachments.
+The Canvas supports clipboard files, file selection and file drop, with removable
+chips and expanded transcript previews. Invalid/unsupported files are rejected before
+a turn starts; failed requests retain the browser draft.
+
+The four protocol adapters translate image/PDF blocks without silently dropping them.
+Actual media support depends on the selected model/gateway. Plain text request shapes
+stay unchanged. Drafts allow eight originals, 20 MiB per original and 40 MiB total;
+normalized image/PDF payloads allow 5 MiB per block and 10 MiB total. PDFs remain
+bounded at 5 MiB; images allow eight frames per file, sixteen per message, 64 million
+pixels per decoded frame and a 4096-pixel long edge in output. Extracted text is limited
+to 128 KiB per file. The local JSON request cap is 56 MiB. Document archives are bounded
+before extraction; formulas and macros are never executed. A token-authenticated local
+`/api/attachments` endpoint validates/converts drafts and returns summaries and marker kinds
+without creating a node; submission validates again and freezes the same representation.
+
 ### 1.1 Interrupting a turn
 
 Esc in the terminal and the stop button on the canvas do the same thing. The turn ends at
@@ -189,6 +233,67 @@ in the terminal opens the canvas and closes the prompt; `/cli` on the canvas clo
 canvas and reopens the prompt. Both surfaces call the same verbs; the canvas adds
 gestures for them — drag a node onto the input to graft, onto the tray to archive.
 
+Slash completion appears above the input, with up to ten visible rows and scrolling.
+Starting `kaipi` (including `-c`/`-r`) or `kaipi canvas` clears the terminal display and
+scrollback before onboarding or session output. Non-interactive subcommands and piped
+output are not cleared.
+At the idle prompt, Ctrl-C first asks for confirmation; a second press within three
+seconds exits. Editing the input cancels that confirmation. During a turn Ctrl-C still
+stops the turn. After saving and releasing the lock, normal session exits clear the
+terminal display and scrollback, then show a local summary: session title, working
+directory, total node count (including archived/aborted nodes), cumulative cost and
+`kaipi -r <full-session-id>` to resume. No model is called. Piped output is not cleared;
+an empty discarded session instead prints `kaipi` to start again.
+
+UI copy lives in a small independent translation module and a bundled Chinese/English
+catalog. On a fresh installation, the first greeting and language picker are bilingual;
+the choice is saved before provider/model setup, which uses that language immediately.
+After successful setup, the terminal display and scrollback are cleared before entering
+the session; cancelled or failed setup and piped output are not cleared.
+Existing configured installations without a language preference keep Chinese. `/config`
+can switch the language with either horizontal arrow; changes save immediately and
+apply to subsequent CLI and Canvas rendering. No model request is made for translation.
+Commands, model IDs, paths, node IDs, original errors from external services, user content
+and tool output retain their original text. UI language never alters system prompts,
+request assembly, stored payloads, attachment content or session titles. Chinese UI uses
+consistent session/trunk/cost terminology; estimated savings remain labelled estimates.
+Status phases keep a centered fixed-width slot: eight terminal cells in Chinese and the
+longest translated phase in English. The catalog is checked for missing entries and
+matching interpolation parameters. Canvas expands only explicitly marked static UI copy
+with context-appropriate escaping; conversation content is never passed to translation.
+
+`/statusline` (also `kaipi statusline`) selects which bottom-line elements are visible:
+provider, model, session title, working directory, context usage, accumulated cost,
+estimated token savings and estimated cost savings. All default to visible. Up/Down
+selects an item; Left/Right cycles backward/forward through its options in a local draft.
+Directory options are full (existing path display), compact (last path component only)
+and off. Context options are full (existing usage display), percent (the same usage
+divided by the selected model's window, with one decimal place) and off. An unknown
+window is shown as unknown, never as zero percent. Other items cycle between on and off.
+Legacy boolean settings retain their meaning: true becomes full/on, false becomes off.
+Esc atomically saves these preferences in the user settings file and returns; Ctrl-C/Ctrl-D cancels the
+draft. A failed save keeps the panel open. Returning refreshes the bar immediately,
+without altering ledger calculations, `/status` details or the activity/elapsed-time row.
+The line keeps its existing space even when all elements are hidden to avoid layout jumps.
+
+`/status` (also `kaipi status`) is a local, read-only overview shared by CLI and Canvas:
+version, selected next-turn model/provider, session, working directory, cursor and next-turn
+mode, pending graft count, cumulative tokens/cache reads and estimated session cost.
+Context usage is the current cursor node's last recorded request, compared with the
+selected model's window from pricing; it is not a next-request token estimate and excludes
+pending grafts. Empty sessions and unknown windows are labelled explicitly. Unpriced
+historical usage is marked in the cost line. It neither creates a turn nor calls a model.
+
+`/inspect-context` serializes only the next request's `system` and `messages` as JSON text
+in a `.md` file, using the same `context.build` as the agent. All message fields and blocks
+(including tools and attachments) are preserved; the next question is a placeholder.
+There are no added headings, annotations or metadata. Provider wire-format conversion
+happens later. No model is called and no session state is mutated.
+The export goes to the session workspace root as
+`YYYYMMDDHHMMSS-<session-title>-<node-label>-context.md` (local time); unsafe filename
+characters are replaced, long titles shortened, and same-second collisions gain `-2`,
+`-3`, etc. before `.md` without overwriting files. The command prints the absolute path.
+
 In the terminal's completion menu, Enter submits the selected slash command, or the
 first matching command when none is selected (so `/tr` submits `/tree`). An exact
 command is kept as typed. After a node-taking command and a space, Enter accepts
@@ -207,7 +312,9 @@ During a terminal turn, a comet and a text shimmer animate at a target 60 FPS in
 dedicated activity row. Its phase follows transient hooks (waiting for the model,
 executing a command, waiting to retry) and the stop flag; these are UI state, never
 session events. The ledger row refreshes separately, and the animation timer is off
-at rest. Questions are echoed as full-width background panels with a blank row of
+at rest. Phase labels are centered in a fixed width of four Chinese characters (eight
+terminal cells), so phase changes do not shift the comet, elapsed time or separators.
+Questions are echoed as full-width background panels with a blank row of
 padding above and below; slash commands keep their compact echo. Wrapped questions
 use terminal cell widths, including CJK characters.
 After a turn, the activity row stays visible with its final elapsed time and outcome
@@ -247,6 +354,20 @@ width minus one; styling resets before the answer, and content still truncates a
 The per-turn usage summary has one blank line above and below it, separating the
 answer from the summary and the next input area's rule.
 
+Terminal lists align columns using the widest displayed cell in the current list,
+ignoring ANSI styling and counting Chinese characters at their terminal width.
+Settings recalculate the layout immediately when the interface language changes.
+
+Interactive slash commands do not echo into the conversation. Query commands (`/help`,
+`/status`, `/version`, `/ledger`, `/raw`, and bare `/trunk`) use a scrollable temporary
+screen, closed with Esc/Ctrl-C. Menus, configuration prompts and rewind previews also
+use the terminal's alternate screen: returning or cancelling restores the conversation
+and its scrollback, with no command or prompt residue. Successful actions retain only a
+compact result; errors remain visible, and `/inspect-context` keeps the exported path.
+`/update` shows progress temporarily and waits for return when no installation starts.
+`/explore`, `/new`, surface switching and session exit retain their own lifecycle.
+Plain/piped commands continue to print ordinary output without alternate-screen controls.
+
 On a TTY, `/tree` and `/go` without arguments open one shared node navigator.
 Tree connectors, node numbers, questions, current position and trunk labels are the
 primary rows. Token counts, cost, graft references and a question preview are shown
@@ -269,10 +390,81 @@ the tree and ask for a node instead. An empty session has no selectable target.
 A lock file (`.kaipi/lock.json`, pid + surface) refuses a second mutating `kaipi` in the
 same directory while a surface is open.
 
+Entering an existing CLI session (`-r`, `-c`, `/resume`, or returning from Canvas)
+replays the stored root-to-cursor conversation before showing the input prompt.
+Questions, compact tool calls and Markdown answers use the normal terminal rendering;
+other branches, injected context blocks, thinking and attachment bodies are omitted.
+Replay is display-only: it makes no model calls, executes no tools and appends no events
+or usage. Switching sessions replaces the previous transcript instead of mixing them.
+
 Every `kaipi` is a fresh conversation. An old one is picked up on purpose - `-c` for the
 latest, `-r <id>` for a given one, `/resume` inside a session - never by accident. A
 conversation can be named (`/rename`); the name is an event in its own log, so it folds
 like everything else and travels with the file.
+
+Every release must support direct, lossless upgrades from all earlier official releases;
+downgrades are not supported. Preserve saved history, attachment bytes, usage, configuration,
+cursor and Git snapshot references. Reading never rewrites old logs; continuing only appends.
+If a format change needs conversion, handle it at the storage boundary, retain the original
+and test the old format. Unknown events must not be silently skipped. Price-derived estimates
+still use the selected pricing table; they are not frozen billing records.
+
+`version` / `/version` read installed package metadata locally. `update` / `/update`
+query the public GitHub latest-release endpoint and show both versions and the release URL.
+The tty starts a daemon check, cached for 24 hours under the user cache directory, with
+one notice per release; failures stay silent. `/config` (also `kaipi config`) opens a
+keyboard settings panel: Up/Down selects a row, Left turns it off, Right turns it on, and
+each change is saved atomically to `~/.config/kaipi/settings.json` without Enter. Esc
+returns, retaining changes already made. Automatic checks default to enabled;
+`KAIPI_NO_UPDATE_CHECK=1` supplies a disabled default until the user explicitly saves a
+choice in the panel. A saved choice takes precedence so the visible setting is effective
+immediately. Turning it on starts a background check with the same 24-hour cache;
+turning it off suppresses future checks and pending notifications. Concurrent automatic
+checks are coalesced. Explicit updates always check again regardless of this setting.
+No project data or model credentials
+are included in these requests. Only newer stable releases can be installed automatically.
+The updater accepts only an identifiable uv tool installation; other installations get
+manual instructions. Download and SHA-256 verification finish before leaving the session.
+Queued messages or attachment/text drafts prevent the terminal handoff. Once ready, save
+the cursor, release the surface lock, then replace the process with a stdlib-only installer.
+It targets the same uv tool directory and entrypoint and resumes the exact session id in
+the original working directory. An empty session is retained during this handoff. Failed
+installation prints a retry command; history and configuration are never rewritten by
+the updater. The verified wheel stays cached because uv records it as its install source.
+Canvas users return with `/cli` before updating.
+
+After the first successful root turn, an unnamed conversation gets a short title from
+an independent model request using only the opening question's first 4,000 characters.
+It uses the same-provider summary model (or the active model), with no project prompt,
+history, attachment contents or tool execution. The answer is displayed before this
+request; the activity line says that a title is being generated. Failure keeps the
+opening-question preview and never fails the completed turn. The naming response must
+be a JSON object containing only a nonempty, single-line `title` of at most 40 characters;
+ordinary replies or malformed output are not saved as names. Previously saved and
+explicitly renamed titles remain unchanged. An explicit name is never
+overwritten. The title and its model/usage are recorded in `session_title_generated`;
+even an empty/refused response is billed. This metadata never enters model context or
+adds a node. `/rename` can replace it. Old logs remain readable without title events.
+The generator lives in `titles.py`, separate from graft summarization. Its boundary is
+plain opening text plus a provider in, title/usage metadata out: it receives no Session,
+Log, State or context builder and cannot persist messages. Only the caller appends the
+metadata event. Naming instructions, title responses and title metadata are excluded
+from trunk/branch history, all graft depths, graft summaries and subsequent model input.
+
+In the terminal, bare `/resume` opens an inline menu of this directory's conversations,
+newest first. The current conversation is selected initially; Up/Down moves a highlighted
+row, Enter resumes it, and Esc cancels without changes. The menu scrolls within ten rows,
+retains title, short ID, time and turn count, and truncates long rows to terminal width.
+Plain/piped input retains the numbered fallback; `/resume <id>` still works directly.
+
+`/new` saves the current cursor, creates a fresh log with the selected model and a new
+snapshot of project instructions, and enters it in place. The old nonempty log remains
+available through `/resume`; an empty abandoned log is removed. No workspace files are
+changed. The new session starts at root with no nodes, grafts, name, usage or cost. The
+terminal clears its display/scrollback, queued inputs, attachment draft and activity state;
+Canvas clears its transcript, draft and view. Like other terminal commands, `/new` entered
+during a turn waits for that turn to finish before switching, then discards remaining
+queued inputs. Canvas rejects it while a turn is running.
 
 ### 7.1 Configuration is a conversation, not an export
 
@@ -281,15 +473,49 @@ model. `/provider` asks for the first (vendor, endpoint - editable, since severa
 run a separate Chinese endpoint with separate keys - key, and the model ids that vendor
 offers you); `/model` picks the second, from every model listed across every configured
 provider, as one list. A first run walks both in order.
+The provider selector starts with an empty number field: users may type a number or
+use Up/Down to highlight a row and fill its number, then Enter confirms. Valid typed
+numbers also highlight their row; invalid/empty input stays in the selector. Existing
+providers open an Up/Down/Enter action menu for refreshing, editing or clearing their
+saved configuration. Clearing removes that provider's saved URL, key and model list,
+and its active selection if applicable, but preserves other providers, history, prices
+and environment variables. Esc at either menu exits without changes.
+In a terminal `/model` uses Up/Down and Enter, initially focused on the active model;
+plain/piped input retains the numbered fallback. Both configuration commands advertise
+Esc cancellation, which exits only the command without saving partial input. Ctrl-C
+inside these menus also cancels the command, rather than exiting the session.
 The model-id prompt defaults to every model listed
 for that provider in the pricing table: Enter accepts all, while a comma-separated
 input selects a subset or supplies custom ids. The pricing table takes precedence
 over a saved subset; if it has no models for the provider, the saved list is used.
 
+Provider setup obtains default model ids from its configured pricing catalog. A preset
+may explicitly share another preset's catalog (for example `deepseek-anthropic` uses
+`deepseek`), without changing the selected protocol, endpoint or credentials. Qualified
+price keys are stripped to model ids in setup; the model selector resolves prices through
+the same `Pricing.find(provider/model)` lookup as requests and the ledger. Unrelated
+regions and subscription plans keep distinct catalogs. DeepSeek's packaged rates are
+fixed peak USD rates; time-of-day discounts are not modelled.
+
+Selecting an already configured provider offers model/price refresh by default, editing
+its endpoint, key and model list, or clearing its configuration. Refresh reads only model rows from kaipi's
+maintained online `master/kaipi/pricing.toml`, without sending API credentials. This is
+not a live vendor inventory: new releases become available when that catalog is updated.
+The preview is saved only on Enter; cancellation, invalid data and network failure leave
+configuration unchanged. Refresh preserves existing/custom model ids and the active model,
+adds catalog ids to `/model`, and stores prices separately in `~/.config/kaipi/catalog.json`.
+Downloaded rows supersede packaged prices, while explicit project/user pricing overrides
+remain authoritative. Remote endpoint declarations are never imported. The current CLI
+session reloads pricing and provider instances after configuration, without restarting.
+
 Credentials go to `~/.config/kaipi/auth.toml`, mode 600, never into a project: a key in a
 repository is a key in someone's clone. The environment still wins over the file, so a
 one-off export overrides a saved key without unsaving it. A missing key is refused with a
 sentence naming the command that fixes it, rather than by letting the vendor answer 401.
+Anthropic clients receive only the selected `api_key` SDK credential. Compatible
+gateways also receive a Bearer header through `default_headers`; it is not a second
+SDK auth mode. Unrelated Anthropic token/profile environment settings do not replace
+the explicitly selected provider key.
 
 The agent's bash is the one way a key could leave that file, so it is closed from both
 ends. Commands run without the variables a key can arrive in (every preset's

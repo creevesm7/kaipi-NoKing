@@ -53,6 +53,17 @@ two presets; the `-anthropic` one is the endpoint each vendor documents for Clau
 because several vendors run a separate Chinese endpoint with separate keys - the key, and
 the model ids you intend to use from it. `kaipi model` then switches between every model
 you listed, across all configured vendors, and activates one.
+In the terminal use Up/Down and Enter to choose a model. Esc cancels either command
+without changing configuration, including while editing an endpoint or entering a key.
+
+The provider number field starts empty. Type a number, or use Up/Down to fill it and
+highlight the provider; Enter confirms. An existing provider opens an arrow-key menu
+for refreshing, editing or clearing its configuration. Clearing only removes that
+provider's saved URL, key and model list (and active selection if it was in use).
+Other providers, history, prices and exported environment variables are retained.
+Refresh previews kaipi's maintained online pricing catalog, then Enter saves and Esc cancels.
+It retains custom model ids, credentials and the active model; `/model` immediately lists
+new ids. A model must first be added to kaipi's online catalog to appear through refresh.
 
 That is stored in `~/.config/kaipi/auth.toml`, mode 600, never in the project. The
 environment still wins over it, so a one-off `MOONSHOT_API_KEY=... kaipi` overrides a saved
@@ -90,10 +101,15 @@ quick retries are not enough on their own.
 
 ## Vendor notes
 
-- **DeepSeek**: `deepseek-v4-flash`, `deepseek-v4-pro`, `deepseek-v4-flash-vision-exp` (the
-  old `deepseek-chat` / `deepseek-reasoner` aliases were retired 2026-07). Cache hits are
-  reported as `prompt_cache_hit_tokens` on the chat endpoint and as Anthropic-shaped usage
-  on `/anthropic`; both feed the ledger. Off-peak pricing is not modelled.
+- **DeepSeek**: `deepseek-flash` and `deepseek-v4-pro` on both the OpenAI Chat and
+  Anthropic endpoints. The Anthropic preset shares the DeepSeek model catalog, while
+  retaining its own protocol, endpoint and credentials. The legacy Flash names
+  `deepseek-v4-flash` and `deepseek-v4-flash-vision-exp` are still accepted by DeepSeek
+  and billed as `deepseek-flash`. Packaged prices follow the official USD peak rates
+  verified on 2026-11-02; off-peak is half price, so the fixed-rate ledger can overestimate
+  actual charges. See [official pricing](https://api-docs.deepseek.com/quick_start/pricing/).
+  Cache hits are reported as `prompt_cache_hit_tokens` on Chat and Anthropic-shaped
+  usage on `/anthropic`; both feed the ledger.
 - **Kimi**: `kimi-k3`, `kimi-k2.7-code`, `kimi-k2.6`, `kimi-k2.5` on the OpenAI-style
   endpoint. On the Anthropic-style endpoint the 1M-context id is `kimi-k3[1m]`:
   `KAIPI_MODEL=kimi-anthropic/kimi-k3[1m]`. The China platform is a separate endpoint with
@@ -111,7 +127,10 @@ quick retries are not enough on their own.
   are priced 0 in `pricing.toml` and the ledger reports tokens only. Model ids come from
   `https://opencode.ai/zen/go/v1/models` (kimi-k3, deepseek-v4-pro, glm-5.3, gpt-5.6-luna,
   minimax-m3, qwen3.8-max, …). Claude models on Zen go through `opencode-anthropic`.
-- **Anthropic-compatible gateways** (`*-anthropic`): kaipi still sends its four
+- **Anthropic-compatible gateways** (`*-anthropic`): the client passes only `api_key`
+  as an SDK credential, with `Authorization: Bearer` in the ordinary request headers.
+  Passing the same key as both `api_key` and `auth_token` is rejected by newer SDKs.
+  kaipi still sends its four
   `cache_control` breakpoints and reads Anthropic-shaped usage, but omits the
   preserved-thinking beta header and `thinking.block_binding`, which only Anthropic
   understands; the gateway's own thinking default applies.
@@ -121,6 +140,9 @@ quick retries are not enough on their own.
 The first of `.kaipi/pricing.toml` in the project, `~/.config/kaipi/pricing.toml`, then the
 copy shipped inside the package. Copy the packaged one to either location to correct a price
 or add a vendor without editing site-packages.
+Refreshed prices are stored separately in `~/.config/kaipi/catalog.json`: they override
+packaged rows, while rows in the chosen project/user pricing file take priority. Refresh
+does not overwrite either custom file or import remote endpoint settings.
 
 **A project file's `[providers]` table is ignored**, with a warning. That table names an
 endpoint URL and an environment variable to send there as a credential; a repository you
@@ -185,3 +207,14 @@ What that run showed for each protocol, on the same scenario:
 
 Prices in `pricing.toml` for non-Anthropic vendors come from public price pages and
 carry the date they were taken; verify before relying on the totals.
+
+## Image and PDF inputs
+
+Attachment images/documents use Anthropic-shaped base64 blocks in the frozen payload.
+Adapters translate them into Chat Completions `image_url` / `file`, Responses
+`input_image` / `input_file`, or Gemini `inlineData`; Anthropic keeps the native blocks.
+Text and extracted Office documents use text blocks on every protocol. Unsupported
+media is not silently discarded: the selected model/gateway must support that media.
+See the [OpenAI file input guide](https://developers.openai.com/api/docs/guides/file-inputs),
+[Anthropic PDF guide](https://platform.claude.com/docs/en/build-with-claude/pdf-support),
+and [Gemini document guide](https://ai.google.dev/gemini-api/docs/document-processing).

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import tomllib
 from collections.abc import Callable
@@ -12,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from kaipi import context, graph
 from kaipi.model import Depth, ReferenceEdge, Usage
+from kaipi.providers import BUILTIN
 from kaipi.store import State
 
 PACKAGED_PRICING = Path(__file__).resolve().parent / "pricing.toml"
@@ -77,15 +79,26 @@ class Pricing(BaseModel):
                 "read from ~/.config/kaipi/pricing.toml or the packaged defaults."
             )
             providers = {}
-        return cls(**raw.get("defaults", {}), models=raw.get("models", {}), providers=providers)
+        models = raw.get("models", {})
+        if path is None:
+            refreshed = catalog_prices()
+            # Explicit local prices win; downloaded rows only supersede packaged defaults.
+            models = models | refreshed if chosen == PACKAGED_PRICING else refreshed | models
+        return cls(**raw.get("defaults", {}), models=models, providers=providers)
 
     def find(self, spec: str) -> Price | None:
         """A spec is a model id listed here, or `<provider>/<model id>`. Prices belong to the
         model, not to the endpoint: `kimi-anthropic/kimi-k2.6` costs what `kimi-k2.6` costs,
-        but is routed to the provider the user named, never to the one the price row names."""
+        but is routed to the provider the user named, never to the one the price row names.
+        Explicit catalog-scoped prices win over bare model rows (e.g. subscription plans)."""
         if spec in self.models:
             return self.models[spec]
         name, _, model = spec.partition("/")
+        preset = BUILTIN.get(name)
+        if model and preset and preset.model_catalog:
+            shared = self.models.get(f"{preset.model_catalog}/{model}")
+            if shared is not None:
+                return shared.model_copy(update={"provider": name})
         if model and model in self.models:
             return self.models[model].model_copy(update={"provider": name})
         return None
@@ -102,6 +115,18 @@ class Pricing(BaseModel):
         """(provider, model id) for the status bars."""
         name, _, model = spec.partition("/")
         return (name, model) if model else (self.price(spec).provider, spec)
+
+
+def catalog_path() -> Path:
+    return user_pricing().with_name("catalog.json")
+
+
+def catalog_prices() -> dict[str, Price]:
+    try:
+        raw = json.loads(catalog_path().read_text(encoding="utf-8"))
+        return {key: Price.model_validate(value) for key, value in raw.items()}
+    except (OSError, ValueError, AttributeError, TypeError):
+        return {}
 
 
 def estimate_tokens(text: str) -> int:
@@ -261,17 +286,17 @@ class Branch(BaseModel):
 
 class Report(BaseModel):
     total_cost: float
-    usage: Usage  # nodes + graft summaries: everything the API billed
+    usage: Usage  # nodes + summaries + titles: everything the API billed
     trunk: str | None
     trunk_burden: int
     branches: list[Branch]
 
 
 def total_cost(state: State, pricing: Pricing) -> float:
-    """Every dollar the session spent: the turns plus the graft summaries, which are
+    """Every dollar the session spent: the turns plus summaries and titles, which are
     charged to no node but are real money."""
     return sum(pricing.price(n.model).cost(n.usage) for n in state.nodes.values()) + sum(
-        pricing.price(m).cost(u) for m, u in state.summaries
+        pricing.price(m).cost(u) for m, u in state.summaries + state.titles
     )
 
 
@@ -279,7 +304,7 @@ def report(state: State, pricing: Pricing) -> Report:
     total = Usage()
     for n in state.nodes.values():
         total = total + n.usage
-    for _, usage in state.summaries:
+    for _, usage in state.summaries + state.titles:
         total = total + usage
     cost = total_cost(state, pricing)
     t = graph.trunk(state)

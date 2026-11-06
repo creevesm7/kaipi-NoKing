@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from kaipi import cli, server
-from kaipi.model import Message, Usage
+from kaipi.model import Message, ReferenceEdge, Usage
 from kaipi.providers import Reply
 from tests.test_cli import Echo
 
@@ -123,12 +123,16 @@ def test_canvas_flow(srv) -> None:  # type: ignore[no-untyped-def]
 
     # slash commands typed on the canvas go through the same verbs
     out = call("/api/command", {"line": "/tree"})["output"]
-    assert "trunk burden" in out and "\x1b" not in out
+    assert "主干上下文" in out and "\x1b" not in out
     assert "\x1b" not in call("/api/command", {"line": "/ledger"})["output"]
+    before = canvas.s.log.path.read_bytes()
+    status = call("/api/command", {"line": "/status"})["output"]
+    assert "会话费用" in status and "上下文" in status and "\x1b" not in status
+    assert canvas.s.log.path.read_bytes() == before
     # a verb that would ask on stdin must not wait there with the lock held
-    assert "needs the terminal" in call("/api/command", {"line": "/provider"})["output"]
-    assert "unknown command" in call("/api/command", {"line": "/nope"})["output"]
-    assert call("/api/command", {"line": "/go nope"})["output"].startswith("error:")
+    assert "需要在终端执行" in call("/api/command", {"line": "/provider"})["output"]
+    assert "未知命令" in call("/api/command", {"line": "/nope"})["output"]
+    assert call("/api/command", {"line": "/go nope"})["output"].startswith("错误：")
     assert "用法：/rewind <节点id>" in call("/api/command", {"line": "/rewind"})["output"]
     assert call("/api/archive", {"id": side}) == {"ok": True}
     assert [n["status"] for n in call("/api/state")["nodes"] if n["id"] == side] == ["archived"]
@@ -154,9 +158,9 @@ def test_canvas_flow(srv) -> None:  # type: ignore[no-untyped-def]
         assert "error" in call(path)
 
     # /explore typed into the canvas runs as a streamed turn, /rewind without a mode explains
-    assert call("/api/command", {"line": "/explore quick look"})["output"] == "exploration started"
+    assert call("/api/command", {"line": "/explore quick look"})["output"] == "已开始探索"
     _wait(canvas)
-    assert "would restore" in call("/api/command", {"line": f"/rewind {merged}"})["output"]
+    assert "将恢复这些文件" in call("/api/command", {"line": f"/rewind {merged}"})["output"]
 
     # busy guard
     canvas.busy = True
@@ -164,10 +168,37 @@ def test_canvas_flow(srv) -> None:  # type: ignore[no-untyped-def]
     canvas.busy = False
 
 
+def test_new_on_canvas_preserves_history_and_rejects_switching_while_busy(srv) -> None:  # type: ignore[no-untyped-def]
+    canvas, call, _, _ = srv
+    call("/api/turn", {"text": "old question"})
+    _wait(canvas)
+    previous = canvas.s.log.path
+    payload = previous.read_bytes()
+    canvas.s.pending = [ReferenceEdge(src_id=canvas.s.leaf or "", dst_id="")]
+    canvas.busy = True
+    assert "error" in call("/api/command", {"line": "/new"})
+    canvas.busy = False
+    assert canvas.s.log.path == previous
+    assert call("/api/command", {"line": "/new nope"})["output"].startswith("错误：")
+    assert canvas.s.log.path == previous
+
+    assert "已开始新会话" in call("/api/command", {"line": "/new"})["output"]
+    state = call("/api/state")
+    assert state["session"] != previous.stem and not state["nodes"]
+    assert state["leaf"] is None and not state["pending"] and state["cost"] == 0
+    assert previous.read_bytes() == payload
+    call("/api/turn", {"text": "new question"})
+    _wait(canvas)
+    node = next(iter(canvas.s.log.state.nodes.values()))
+    assert node.parent_id is None and "old question" not in str(node.payload)
+    call("/api/command", {"line": f"/resume {previous.stem}"})
+    assert call("/api/state")["session"] == previous.stem
+
+
 def test_handoff_and_lock(srv, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
     canvas, call, base, token = srv
     q = canvas.hub.subscribe()
-    assert call("/api/command", {"line": "/cli"})["output"].startswith("handing")
+    assert call("/api/command", {"line": "/cli"})["output"].startswith("正在将会话")
     assert canvas.handoff and json.loads(q.get(timeout=1))["type"] == "handoff"
 
     cli.set_lock(tmp_path, "canvas", base)
@@ -305,3 +336,49 @@ def test_smoke_script_plumbing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     )
     assert r.returncode == 0, r.stdout[-4000:] + r.stderr[-2000:]
     assert "0 failed" in r.stdout
+
+
+def test_canvas_accepts_attachment_snapshots_and_rejects_invalid_data(srv, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import base64
+
+    from tests.test_attachments import PNG
+
+    canvas, call, _, _ = srv
+    seen: list[Message] = []
+
+    class Inspect(Echo):
+        def complete(self, system: str, messages: list[Message], cache_points: list[int]) -> Reply:
+            seen.extend(messages)
+            return Reply(
+                content=[{"type": "text", "text": "seen image"}],
+                stop_reason="end_turn",
+                usage=Usage(),
+            )
+
+    monkeypatch.setattr(cli.Session, "_build", lambda self, model: Inspect())
+    before = canvas.s.log.path.read_bytes()
+    metadata = call(
+        "/api/attachments",
+        {"attachments": [{"name": "image.png", "data": base64.b64encode(PNG).decode()}]},
+    )["attachments"][0]
+    assert metadata["kind"] == "image" and metadata["name"] == "image.png"
+    assert set(metadata) == {"name", "summary", "kind"}, "draft markers need no thumbnail payload"
+    assert canvas.s.log.path.read_bytes() == before
+    call(
+        "/api/turn",
+        {
+            "text": "解释这张图",
+            "attachments": [{"name": "image.png", "data": base64.b64encode(PNG).decode()}],
+        },
+    )
+    _wait(canvas)
+    assert seen[0]["content"][1]["type"] == "image"
+    assert seen[0]["content"][1]["source"]["data"] == base64.b64encode(PNG).decode()
+    leaf = canvas.s.leaf
+    assert leaf is not None
+    replay = call("/api/node/" + leaf)
+    assert any(row["kind"] == "image" for row in replay)
+    before = canvas.s.log.path.read_bytes()
+    response = call("/api/turn", {"text": "bad", "attachments": [{"name": "bad", "data": "!!!"}]})
+    assert "error" in response and not canvas.busy
+    assert canvas.s.log.path.read_bytes() == before
