@@ -16,6 +16,12 @@ context. Tool calls are never nodes of their own.
 Once the turn ends, the node's `payload` is frozen. Anything that looks like a change is
 a new node or a status change.
 
+Command stdout and stderr are decoded as UTF-8 with replacement: invalid bytes become
+`�`, while valid UTF-8 text stays intact. Output encoding alone must not abort a turn.
+Decoded output follows the same credential redaction and truncation rules before being
+shown, stored or sent to the model. Exit codes, timeouts, user stops and process-group
+cleanup retain their existing behaviour.
+
 Status: `live` (part of context), `archived` (out of context, reversible; archiving a
 subtree is one atomic operation), `aborted` (the user stopped the turn: out of context
 for good, still billed), `tombstone` (permanent; one line remains).
@@ -96,6 +102,32 @@ Anything else the provider does - a 401, a dead network, an expired key - ends t
 the way a stop does: the node becomes `aborted`, so the tokens it already burned stay on
 the bill, the cursor moves back to the parent, and the surface prints one sentence. A
 provider must never be able to take a session down with it.
+
+### 1.3 Retrying the latest turn
+
+`/retry` re-runs only the latest attempt in the current session, whether completed,
+failed or cancelled; it accepts no node argument. Failure/cancellation surfaces suggest
+the command, while success does not. Core exposes synchronous `Session.retry()` and
+background `Session.start_retry(emit)`, using the ordinary execution, stop and event
+lifecycle. Canvas exposes the same operation through `POST /api/retry {}` and `/retry`.
+
+Each new node records its original input blocks (including attachment snapshots),
+explicit graft selections, execution role and original trunk. Preparation failures also
+record an aborted attempt, so retry cannot accidentally repeat an earlier successful
+question. Retry creates a sibling under the original parent, never appends to or rewrites
+the old payload. Only the parent's live lineage and the original input/graft snapshots
+enter the new request; old replies, tool results and errors are excluded. Attachments
+are not re-read or parsed, and materialised grafts are not summarised again.
+
+An exploration retry leaves the trunk in place. A successful trunk retry pins the new
+node as trunk; failure leaves the previous valid trunk in place. The cursor follows the
+new result, or returns to the original parent on failure. Costs and historical attempts
+remain in the append-only log; filesystem changes are not automatically undone. Retry
+uses the currently selected model. A running turn, changed cursor/trunk or pending grafts,
+archived target, or missing original input is rejected before execution. Older nodes
+recover input, graft snapshots and execution role from their frozen payload and prior log
+state when available; incomplete crash records without an input cannot be retried.
+New optional event fields preserve reading and continuing older sessions.
 
 ## 2. Edges
 
@@ -222,6 +254,51 @@ read-only notice on its next turn like any other exploration.
 | Graft depth `branch` with the source on the current lineage | Rejected | Nothing to graft. |
 
 ## 7. Surfaces
+
+kaipi is one product containing an interface-independent application core and its built-in
+CLI. Canvas is a bundled client of that same core. `core.Session` owns the log, cursor,
+provider selection, mutations and execution lifecycle; `core.run_input` runs a turn and
+emits small data events. Neither depends on CLI, HTTP, terminal widgets or rendering.
+The existing context, graph, ledger, provider, attachment and storage modules implement
+the core's domain rules; they do not acquire a second implementation for each surface.
+
+`views.py` adapts slash syntax and renders core results as text. CLI/TUI handle keyboard
+input, confirmations and display; `server.py` adapts core operations and events to the
+existing local HTTP/SSE routes. Interfaces do not append log events or modify the cursor
+or pending grafts directly. Configuration prompts collect user choices; the shared
+provider, catalog and settings modules validate and persist them. Catalog refresh can be
+prepared without saving, so Esc still cancels the entire change.
+
+One core session admits one executing turn. State-changing operations are serialized and
+persisted by the core, and refused while execution is in progress (including draft graft
+changes). Stop remains available. Each cursor operation saves once; metadata and read-only
+operations do not rewrite the cursor. Completed/aborted/error events are delivered before
+releasing the busy state, with completed/aborted events following persistence. Event
+callbacks must return promptly and must not wait for another session operation.
+Pending grafts are consumed only after a successful turn; summary preparation, provider
+failure and interruption keep the original selections. All graft entry points resolve
+canonical IDs and apply the same domain validation before saving. Cursor moves and
+archive/restore validate pending grafts against the destination before changing events or
+restoring code; a conflicting selection stays untouched. Core snapshots capture
+the log version, cursor and execution flags together; formatting and model calls run
+outside the lock. CLI and Canvas share the core's status figures.
+
+Cursor writes use an atomic replacement. If a command fails before replacement, its
+in-memory selection is restored; if replacement committed before an interruption, the
+committed selection is retained. Already appended events and filesystem work are not
+rolled back. A completed
+turn stays available in memory and in the log even if its final cursor save fails.
+A corrupt cursor is preserved as `cursor.corrupt-<id>.json`; opening a session falls
+back to its trunk. This recovers history, but cannot reconstruct corrupt draft grafts.
+
+A Canvas handoff requires an idle session and closes that client's mutation gate under
+the same lock. Late requests, including stop, are rejected even before HTTP shutdown
+finishes. Attachment parsing and HTTP response writes run outside the gate, so they cannot
+block stop. Parsed input rechecks the client's gate and session position before submission.
+Ctrl-C in its hosting terminal stops and waits for the turn before returning to
+CLI. This phase keeps the existing in-process lifecycle,
+installation and on-disk formats. It adds no daemon, separate core distribution, remote
+client protocol or plugin framework.
 
 The session lives in one process and is open on exactly one surface at a time: the
 terminal or the canvas (a local web page served by the same process). The terminal keeps a

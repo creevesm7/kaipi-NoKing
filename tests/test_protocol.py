@@ -15,6 +15,8 @@ from typing import Any
 
 import pytest
 
+from kaipi import core
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import mockapi  # noqa: E402
@@ -52,11 +54,40 @@ def session_on(url: str, model: str, provider_env: str, path: str = "/v1") -> tu
     if preset and preset.api_key_env:
         os.environ[preset.api_key_env] = "mock-key"
     os.environ["KAIPI_MODEL"] = model
-    s = cli.Session(root, new=True)
+    s = core.Session(root, new=True)
     tally = smoke.Tally(s._build(model))
     s._provider = tally
     s._cheap = tally
     return s, tally, root
+
+
+@pytest.mark.parametrize(
+    "model,env,path",
+    [
+        ("claude-opus-5", "ANTHROPIC", ""),
+        ("openai/gpt-5.6-terra", "OPENAI", "/v1"),
+        ("deepseek/deepseek-v4-flash", "DEEPSEEK", "/v1"),
+        ("gemini/gemini-3.7-flash", "GEMINI", "/v1beta"),
+    ],
+)
+def test_retry_sends_the_original_request_over_every_protocol(
+    endpoint: tuple[mockapi.MockServer, str], model: str, env: str, path: str
+) -> None:
+    srv, url = endpoint
+
+    class Answers(mockapi.Brain):
+        def act(self, turn: mockapi.Turn) -> dict[str, Any]:
+            return {"text": f"ANSWER-{len(srv.api.requests)}"}
+
+    srv.api.brain = Answers()
+    s, _, _ = session_on(url, model, env, path)
+    s.rename("protocol retry")
+    original, _ = core.run_input(s, "original question")
+    first = srv.api.requests[-1]["body"]
+    replacement, _ = s.retry()
+    assert replacement != original and s.log.state.nodes[replacement].parent_id is None
+    assert srv.api.requests[-1]["body"] == first
+    assert graph.trunk(s.log.state) == replacement
 
 
 def test_a_long_tool_loop_does_not_break_the_next_turn_cache(endpoint) -> None:  # type: ignore[no-untyped-def]

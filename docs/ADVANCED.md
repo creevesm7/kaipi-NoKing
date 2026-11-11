@@ -3,6 +3,35 @@
 Everything here used to live in the README. It is the detail you need when you are
 running kaipi against a real endpoint, or working on kaipi itself.
 
+## Application boundary
+
+The `kaipi` distribution contains the core and the built-in CLI. Canvas remains bundled,
+using the same core rather than calling CLI internals. Future clients can wrap the product
+without implementing their own agent loop or session format.
+
+- `core.py`: `Session`, synchronous `run_input`, background `Session.start`, stop,
+  structured events, snapshots and persisted session operations.
+- Existing domain modules: context, graph, providers, attachments, ledger and storage.
+- `views.py`: shared slash syntax and text rendering; no direct state writes.
+- `cli.py`, `tui.py`, `configuration.py`: terminal entry points and interaction.
+- `server.py`, `canvas.html`: HTTP/SSE and browser interaction.
+
+Core operations return data, not terminal output. For example, `session.go("N1")` moves
+and saves the cursor; the CLI formats a confirmation and Canvas refreshes its state.
+The same stored session can be reopened by either interface. `core.Event` carries model
+and tool text or semantic lifecycle events; each interface renders them in its own way.
+
+`session.retry()` synchronously re-runs the latest attempt and returns `(node_id, dirty)`;
+`session.start_retry(emit)` reserves it immediately and returns a worker thread. Both use
+the current selected model, preserve the original submission/role and create a sibling.
+`session.stop()` interrupts either path. `session.can_retry` reports availability, while
+`session.retry_node()` validates and returns a detached snapshot for a client's preview.
+An aborted event has `retryable: true`; clients can suggest `/retry` after an unsuccessful
+attempt. No retry suggestion is emitted on success.
+
+This is a module boundary within one installation and process. Independent process
+attachment, background-service lifetime and a versioned external protocol are future work.
+
 ## Local HTTP API
 
 The canvas is served by the same process that runs the session, on `127.0.0.1` with a
@@ -18,7 +47,9 @@ Endpoints: `GET /api/state`, `GET /api/node/<id>`, `GET /api/preview?src=&tools=
 `GET /api/rewind?id=`, `GET /api/events` (SSE), `POST /api/turn {text, explore}`,
 `/api/command {line}`, `/api/go`, `/api/archive`, `/api/restore`, `/api/pin`,
 `/api/rewind {id, mode}`, `/api/pending {edges}`, `/api/reset`, `/api/handoff`,
-`/api/stop`.
+`/api/stop`, `POST /api/retry {}`. The retry route accepts no node id or other parameters;
+`GET /api/state` includes `retryable`. Busy/changed-position requests return 409 and a
+closed Canvas returns 410. Original submissions are stored by the core, not the client.
 
 The canvas folds a command's output to its first four lines and expands it on a click; the
 terminal prints the same four and says how many it kept back, since scrollback cannot be
